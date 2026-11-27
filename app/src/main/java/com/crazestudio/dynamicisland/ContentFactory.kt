@@ -232,7 +232,7 @@ class ContentFactory(private val ctx: Context, notch: Notch.Info, private val cb
             isFillViewport = false
             isVerticalScrollBarEnabled = false
             clipToPadding = false
-            addView(content, ScrollView.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(content, ViewGroup.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         return Built(scroll, w, viewportHeight, expandedR, ui)
     }
