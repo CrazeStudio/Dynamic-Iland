@@ -18,9 +18,8 @@ import kotlin.math.exp
 import kotlin.math.min
 
 /**
- * The black pill. It owns its own animated size, so the overlay window
- * (WRAP_CONTENT) grows and shrinks with it. Content is clipped to the
- * rounded outline while the pill morphs between sizes.
+ * The black pill. It owns its animated size, so the overlay window (WRAP_CONTENT)
+ * follows the content. Content is clipped to the rounded outline while the pill morphs.
  */
 class IslandView(context: Context) : FrameLayout(context) {
 
@@ -40,7 +39,7 @@ class IslandView(context: Context) : FrameLayout(context) {
     private var content: View? = null
     private var anim: ValueAnimator? = null
 
-    /** Damped spring: overshoots slightly, then settles. */
+    /** Damped spring easing; dimensions are clamped so the overlay never overshoots its safe bounds. */
     private val spring = TimeInterpolator { t ->
         1f - exp(-6.5f * t) * cos(2f * Math.PI.toFloat() * 1.15f * t)
     }
@@ -48,10 +47,7 @@ class IslandView(context: Context) : FrameLayout(context) {
     private val gestures = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(e: MotionEvent): Boolean = true
 
-        override fun onSingleTapUp(e: MotionEvent): Boolean {
-            listener?.onTap()
-            return true
-        }
+        override fun onSingleTapUp(e: MotionEvent): Boolean = performClick()
 
         override fun onLongPress(e: MotionEvent) {
             listener?.onLongPress()
@@ -73,6 +69,7 @@ class IslandView(context: Context) : FrameLayout(context) {
     init {
         background = bg
         isClickable = true
+        isFocusable = true
         clipToPadding = false
         outlineProvider = object : ViewOutlineProvider() {
             override fun getOutline(view: View, outline: Outline) {
@@ -83,15 +80,21 @@ class IslandView(context: Context) : FrameLayout(context) {
         clipToOutline = true
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean = gestures.onTouchEvent(event)
+    override fun performClick(): Boolean {
+        super.performClick()
+        listener?.onTap()
+        return true
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean = gestures.onTouchEvent(event) || super.onTouchEvent(event)
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         for (i in 0 until childCount) {
             val c = getChildAt(i)
             val lp = c.layoutParams
             c.measure(
-                MeasureSpec.makeMeasureSpec(lp.width, MeasureSpec.EXACTLY),
-                MeasureSpec.makeMeasureSpec(lp.height, MeasureSpec.EXACTLY)
+                MeasureSpec.makeMeasureSpec(lp.width.coerceAtLeast(0), MeasureSpec.EXACTLY),
+                MeasureSpec.makeMeasureSpec(lp.height.coerceAtLeast(0), MeasureSpec.EXACTLY)
             )
         }
         setMeasuredDimension(curW.toInt().coerceAtLeast(1), curH.toInt().coerceAtLeast(1))
@@ -149,7 +152,8 @@ class IslandView(context: Context) : FrameLayout(context) {
             duration = 520
             interpolator = spring
             addUpdateListener {
-                val p = if (it.animatedFraction >= 1f) 1f else it.animatedValue as Float
+                // The spring intentionally eases past its endpoint; clamp to keep the overlay in bounds.
+                val p = (it.animatedValue as Float).coerceIn(0f, 1f)
                 curW = fw + (w - fw) * p
                 curH = fh + (h - fh) * p
                 curR = fr + (r - fr) * p
