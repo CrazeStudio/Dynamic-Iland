@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.os.BatteryManager
@@ -20,15 +21,18 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.widget.FrameLayout
 
 /**
  * Owns the overlay window and decides what the island shows.
  *
- * Priority: call > notification / charging (queued) > media.
- * After the auto-dismiss time (default 5 s) the island shrinks to a small dot,
- * slides to the notch and fades out, so it hides inside the cutout.
+ * Flow for anything that keeps running (music, downloads, charging):
+ *   peek  ->  (after the auto-dismiss time)  ->  small coloured dot in the notch
+ *   tap the dot to expand it again. When the activity ends, the dot disappears.
+ * One-off things (messages) just peek and then hide in the notch.
  */
 class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
@@ -39,17 +43,21 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
     private var attached = false
     private var idle = true
+    private var dotMode = false
+    private var shownDot: Int? = null
     private var notch = Notch.detect(ctx, prefs)
     private var factory = ContentFactory(ctx, notch, this)
 
     private var media: MediaInfo? = null
-    private var mediaSnoozed = false
+    private var mediaSnoozed = false      // dismissed by the user (swipe up)
+    private var mediaCollapsed = false    // shrunk to a dot after the timeout
     private var mediaUi: ContentFactory.MediaUi? = null
     private var tracker: MediaTracker? = null
 
     private var current: Live? = null
     private val pending = ArrayDeque<Live>()
-    private val silenced = HashSet<String>()
+    /** Ongoing activities (downloads, charging) that are shown as a dot. */
+    private val background = LinkedHashMap<String, Live>()
     private var expanded = false
     private var focusMedia = false
     private var fsHidden = false
@@ -76,6 +84,11 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
             ctx.registerReceiver(receiver, filter)
+        }
+        // already plugged in when the island starts: show the charging dot
+        val bi = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        if (prefs.showCharging && (bi?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0) != 0) {
+            background[CHARGING_KEY] = Live.Charging(batteryLevel(), false)
         }
         tracker = MediaTracker(ctx) { onMedia(it) }
         if (prefs.showMedia) tracker?.start()
@@ -110,7 +123,12 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             tracker?.stop()
             media = null
         }
-        if (!prefs.showNotifications && current is Live.Notif) finishCurrent(false)
+        if (!prefs.showNotifications) {
+            background.values.removeAll { it is Live.Notif }
+            if (current is Live.Notif) finishCurrent(false, false)
+        }
+        if (!prefs.showCharging) background.remove(CHARGING_KEY)
+        shownDot = null
         if (attached) updateWindow()
         render(false)
     }
@@ -140,9 +158,6 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val text = (e.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: e.getCharSequence(Notification.EXTRA_TEXT) ?: "").toString()
         if (title.isBlank() && text.isBlank()) return
 
-        val key = sbn.key
-        if (inProgress && key in silenced && current?.key != key) return
-
         val (label, icon) = appInfo(pkg, e)
         val avatar: Drawable? = try {
             n.getLargeIcon()?.loadDrawable(ctx)
@@ -155,7 +170,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
         post(
             Live.Notif(
-                key = key, appName = label, icon = icon, avatar = avatar,
+                key = sbn.key, appName = label, icon = icon, avatar = avatar,
                 title = title, text = text,
                 progress = if (inProgress) prog else 0,
                 progressMax = if (inProgress) max else 0,
@@ -166,9 +181,9 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     }
 
     fun onNotificationRemoved(key: String) {
-        silenced.remove(key)
+        background.remove(key)
         pending.removeAll { it.key == key }
-        if (current?.key == key) finishCurrent(true)
+        if (current?.key == key) finishCurrent(true, false) else if (idle) render()
     }
 
     private fun onMedia(info: MediaInfo?) {
@@ -176,6 +191,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         media = info
         if (info == null || old == null || old.title != info.title || (info.playing && !old.playing)) {
             mediaSnoozed = false
+            mediaCollapsed = false
         }
         if (info == null) {
             focusMedia = false
@@ -190,8 +206,9 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             when (i.action) {
                 Intent.ACTION_POWER_CONNECTED -> if (prefs.showCharging) post(Live.Charging(batteryLevel(), false))
                 Intent.ACTION_POWER_DISCONNECTED -> {
+                    background.remove(CHARGING_KEY)
                     pending.removeAll { it is Live.Charging }
-                    if (current is Live.Charging) finishCurrent(true)
+                    if (current is Live.Charging) finishCurrent(true, false) else if (idle) render()
                 }
                 Intent.ACTION_BATTERY_LOW -> if (prefs.showCharging) post(Live.Charging(batteryLevel(), true))
             }
@@ -202,7 +219,18 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
     private fun Live.isCall() = this is Live.Notif && this.isCall
 
+    /** Things that keep running and should stay visible as a dot. */
+    private fun isOngoing(t: Live) = (t is Live.Notif && t.hasProgress) || (t is Live.Charging && !t.low)
+
     private fun post(t: Live) {
+        // an activity that is already running as a dot: update it quietly
+        if (background.containsKey(t.key)) {
+            if (isOngoing(t)) {
+                background[t.key] = t
+                return
+            }
+            background.remove(t.key)
+        }
         val cur = current
         if (cur != null && cur.key == t.key) {
             current = t
@@ -226,15 +254,16 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         render()
     }
 
-    private fun finishCurrent(animate: Boolean) {
-        (current as? Live.Notif)?.let { if (it.hasProgress) silenced.add(it.key) }
+    private fun finishCurrent(animate: Boolean, keep: Boolean = true) {
+        val c = current
+        if (keep && c != null && isOngoing(c)) background[c.key] = c
         current = pending.removeFirstOrNull()
         expanded = current?.isCall() == true && (current as Live.Notif).actions.size >= 2
         scheduleTimeout()
         render(animate)
     }
 
-    /** Fires after the auto-dismiss time: collapse, then shrink to a dot and hide in the notch. */
+    /** Fires after the auto-dismiss time. */
     private val timeout = Runnable {
         when {
             mediaShown() && expanded -> {
@@ -243,10 +272,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
                 render()
             }
             mediaShown() -> {
-                mediaSnoozed = true
+                mediaCollapsed = true // music keeps playing: become a dot
                 render()
             }
-            current != null -> finishCurrent(true)
+            current != null -> finishCurrent(true) // ongoing ones become a dot, others hide
         }
     }
 
@@ -270,9 +299,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         return if (current == null || focusMedia) m else null
     }
 
+    /** True while the media layout (compact or expanded) is on screen. */
     private fun mediaShown(): Boolean {
         val m = activeMedia() ?: return false
-        return expanded || m.playing
+        return expanded || (m.playing && !mediaCollapsed)
     }
 
     private val moveRunnable = Runnable { if (idle) updateWindow() }
@@ -295,6 +325,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val landscape = ctx.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         if (landscape && prefs.hideInLandscape) {
             idle = true
+            dotMode = false
             detachNow()
             return
         }
@@ -302,7 +333,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val m = activeMedia()
         val t = current
         val built: ContentFactory.Built? = when {
-            m != null && (expanded || m.playing) ->
+            m != null && (expanded || (m.playing && !mediaCollapsed)) ->
                 if (expanded) factory.mediaExpanded(m) else factory.mediaCompact(m)
             t != null -> if (expanded) factory.liveExpanded(t) else factory.livePeek(t)
             else -> null
@@ -315,20 +346,51 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         }
         val wasIdle = idle
         idle = false
+        dotMode = false
+        shownDot = null
         val first = !attached
         attach()
         if (!attached) return
         if (first) view.snapTo(dotSize(), dotSize(), dotSize() / 2f)
-        else if (wasIdle) updateWindow() // slide back down from the notch
+        else if (wasIdle) updateWindow() // slide back down out of the notch
         view.show(built.view, built.w, built.h, built.radius, true)
     }
 
-    /** Shrink to a dot, slide into the notch, fade out. */
+    private fun dotColor(): Int? {
+        val bgItem = background.values.lastOrNull()
+        if (bgItem != null) return if (bgItem is Live.Charging) GREEN else BLUE
+        val m = activeMedia()
+        if (m != null && m.playing) return PINK
+        return null
+    }
+
+    private fun dotBuilt(color: Int): ContentFactory.Built {
+        val s = dotBox()
+        val box = FrameLayout(ctx)
+        box.addView(
+            View(ctx).apply { background = roundBg(color, ctx.dpf(8f)) },
+            FrameLayout.LayoutParams(ctx.dp(10), ctx.dp(10), Gravity.CENTER)
+        )
+        return ContentFactory.Built(box, s, s, s / 2f)
+    }
+
+    /** Nothing to announce: show a dot if something is still running, otherwise hide in the notch. */
     private fun goIdle(animate: Boolean) {
         idle = true
         mediaUi = null
+        val color = dotColor()
+        dotMode = color != null
+
         if (!attached) {
-            if (prefs.alwaysShowPill) {
+            if (color != null) {
+                attach()
+                if (attached) {
+                    val b = dotBuilt(color)
+                    view.snapTo(b.w, b.h, b.radius)
+                    view.show(b.view, b.w, b.h, b.radius, false)
+                    shownDot = color
+                }
+            } else if (prefs.alwaysShowPill) {
                 attach()
                 if (attached) {
                     view.snapTo(idleW(), idleH(), idleH() / 2f)
@@ -337,10 +399,21 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             }
             return
         }
+
+        if (color != null) {
+            if (shownDot == color) return // already showing this dot
+            val b = dotBuilt(color)
+            view.show(b.view, b.w, b.h, b.radius, animate)
+            shownDot = color
+            h.postDelayed(moveRunnable, 380)
+            return
+        }
+        shownDot = null
         if (prefs.alwaysShowPill) {
             view.show(null, idleW(), idleH(), idleH() / 2f, animate)
             return
         }
+        // hide: shrink, slide into the notch, fade out
         val d = dotSize()
         view.show(null, d, d, d / 2f, animate)
         h.postDelayed(moveRunnable, 380)
@@ -348,6 +421,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     }
 
     private fun dotSize() = ctx.dp(10)
+    private fun dotBox() = ctx.dp(26)
     private fun idleW() = if (prefs.idleWidth > 0) ctx.dp(prefs.idleWidth) else maxOf(notch.w, ctx.dp(28))
     private fun idleH() = if (prefs.idleHeight > 0) ctx.dp(prefs.idleHeight) else maxOf(notch.h, ctx.dp(24))
 
@@ -359,9 +433,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         if (fsHidden) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        // When resting as a dot, sit in the middle of the cutout so it disappears into it.
-        val restingInNotch = idle && !prefs.alwaysShowPill
-        val yPx = if (restingInNotch) maxOf(0, (notch.h - dotSize()) / 2) else ctx.dp(prefs.offsetY)
+        // Resting as a dot: sit in the middle of the cutout so it lives inside the notch.
+        val inNotch = idle && (dotMode || !prefs.alwaysShowPill)
+        val restSize = if (dotMode) dotBox() else dotSize()
+        val yPx = if (inNotch) maxOf(0, (notch.h - restSize) / 2) else ctx.dp(prefs.offsetY)
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -396,6 +471,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         }
         view.clear()
         attached = false
+        shownDot = null
     }
 
     private fun updateWindow() {
@@ -421,7 +497,27 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
     // ------------------------------------------------------------------ gestures
 
+    /** Tap on the dot: bring the running activity back as an expanded card. */
+    private fun expandFromDot() {
+        val item = background.values.lastOrNull()
+        if (item != null) {
+            background.remove(item.key)
+            current = if (item is Live.Charging) Live.Charging(batteryLevel(), false) else item
+            focusMedia = false
+        } else {
+            mediaCollapsed = false
+        }
+        expanded = true
+        buzz()
+        scheduleTimeout()
+        render()
+    }
+
     private fun handleTap() {
+        if (idle && dotMode) {
+            expandFromDot()
+            return
+        }
         if (!expanded) {
             if (current != null || mediaShown()) setExpanded(true)
             return
@@ -438,6 +534,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     }
 
     private fun handleLongPress() {
+        if (idle && dotMode) {
+            expandFromDot()
+            return
+        }
         if (expanded) {
             setExpanded(false)
             return
@@ -451,7 +551,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         when {
             expanded -> setExpanded(false)
             mediaShown() -> {
-                mediaSnoozed = true
+                mediaCollapsed = true
                 render()
             }
             current != null -> finishCurrent(true)
@@ -481,7 +581,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     override fun runAction(pi: PendingIntent?, finish: Boolean) {
         openPi(pi)
         val t = current
-        if (finish && t != null && !mediaShown()) finishCurrent(true) else if (finish) setExpanded(false)
+        if (finish && t != null && !mediaShown()) finishCurrent(true, false) else if (finish) setExpanded(false)
     }
 
     override fun mediaCmd(cmd: Int) {
@@ -549,6 +649,14 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         }
     }
 
+    /** Removes a preview activity after a while so its dot does not stay forever. */
+    private fun endDemo(key: String, afterMs: Long) {
+        h.postDelayed({
+            background.remove(key)
+            if (current?.key == key) finishCurrent(true, false) else if (idle) render()
+        }, afterMs)
+    }
+
     /** Used by the settings screen's preview buttons. */
     fun demo(kind: String) {
         val icon = try {
@@ -571,19 +679,29 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
                         0, 0, false, null, listOf(Act("Decline", null), Act("Answer", null)), true
                     )
                 )
-                h.postDelayed({ if (current?.key == "demo_call") finishCurrent(true) }, 8000)
+                endDemo("demo_call", 8000)
             }
-            "charge" -> post(Live.Charging(batteryLevel(), false))
-            "progress" -> post(
-                Live.Notif(
-                    "demo_progress", "Downloads", icon, null, "Downloading update", "72% complete",
-                    72, 100, false, null, emptyList(), false
+            "charge" -> {
+                post(Live.Charging(batteryLevel(), false))
+                endDemo(CHARGING_KEY, 15000)
+            }
+            "progress" -> {
+                post(
+                    Live.Notif(
+                        "demo_progress", "Downloads", icon, null, "Downloading update", "72% complete",
+                        72, 100, false, null, emptyList(), false
+                    )
                 )
-            )
+                endDemo("demo_progress", 20000)
+            }
         }
     }
 
     companion object {
         private const val TAG = "DynamicIsland"
+        private const val CHARGING_KEY = "charging"
+        private val GREEN = Color.parseColor("#34D399")
+        private val BLUE = Color.parseColor("#60A5FA")
+        private val PINK = Color.parseColor("#F472B6")
     }
 }
