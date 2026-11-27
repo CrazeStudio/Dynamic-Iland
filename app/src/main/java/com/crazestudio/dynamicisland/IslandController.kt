@@ -27,7 +27,8 @@ import android.view.WindowManager
  * Owns the overlay window and decides what the island shows.
  *
  * Priority: call > notification / charging (queued) > media.
- * Media sits in the compact state while nothing else is happening.
+ * After the auto-dismiss time (default 5 s) the island shrinks to a small dot,
+ * slides to the notch and fades out, so it hides inside the cutout.
  */
 class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
@@ -233,12 +234,19 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         render(animate)
     }
 
+    /** Fires after the auto-dismiss time: collapse, then shrink to a dot and hide in the notch. */
     private val timeout = Runnable {
-        if (mediaShown() && expanded) {
-            expanded = false
-            render()
-        } else if (current != null) {
-            finishCurrent(true)
+        when {
+            mediaShown() && expanded -> {
+                expanded = false
+                scheduleTimeout()
+                render()
+            }
+            mediaShown() -> {
+                mediaSnoozed = true
+                render()
+            }
+            current != null -> finishCurrent(true)
         }
     }
 
@@ -246,10 +254,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         h.removeCallbacks(timeout)
         val t = current
         if (t != null && t.isCall()) return
-        if (mediaShown() && expanded) {
-            h.postDelayed(timeout, 8000)
+        val secs = prefs.autoDismissSec.coerceIn(2, 30)
+        if (mediaShown()) {
+            h.postDelayed(timeout, if (expanded) 8000L else secs * 1000L)
         } else if (t != null) {
-            val secs = prefs.autoDismissSec.coerceIn(2, 30)
             h.postDelayed(timeout, (if (expanded) secs * 3 else secs) * 1000L)
         }
     }
@@ -267,10 +275,23 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         return expanded || m.playing
     }
 
-    private val detachRunnable = Runnable { if (idle) detachNow() }
+    private val moveRunnable = Runnable { if (idle) updateWindow() }
+
+    private val detachRunnable = Runnable {
+        if (idle) {
+            view.animate().alpha(0f).setDuration(220).withEndAction {
+                if (idle && view.alpha < 0.05f) detachNow()
+            }.start()
+        }
+    }
 
     private fun render(animate: Boolean = true) {
         h.removeCallbacks(detachRunnable)
+        h.removeCallbacks(moveRunnable)
+        if (attached) {
+            view.animate().cancel()
+            view.alpha = if (fsHidden) 0f else 1f
+        }
         val landscape = ctx.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         if (landscape && prefs.hideInLandscape) {
             idle = true
@@ -292,14 +313,17 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             goIdle(animate)
             return
         }
+        val wasIdle = idle
         idle = false
         val first = !attached
         attach()
         if (!attached) return
-        if (first) view.snapTo(idleW(), idleH(), idleH() / 2f)
-        view.show(built.view, built.w, built.h, built.radius, animate && !first || first)
+        if (first) view.snapTo(dotSize(), dotSize(), dotSize() / 2f)
+        else if (wasIdle) updateWindow() // slide back down from the notch
+        view.show(built.view, built.w, built.h, built.radius, true)
     }
 
+    /** Shrink to a dot, slide into the notch, fade out. */
     private fun goIdle(animate: Boolean) {
         idle = true
         mediaUi = null
@@ -313,10 +337,17 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             }
             return
         }
-        view.show(null, idleW(), idleH(), idleH() / 2f, animate)
-        if (!prefs.alwaysShowPill) h.postDelayed(detachRunnable, 420)
+        if (prefs.alwaysShowPill) {
+            view.show(null, idleW(), idleH(), idleH() / 2f, animate)
+            return
+        }
+        val d = dotSize()
+        view.show(null, d, d, d / 2f, animate)
+        h.postDelayed(moveRunnable, 380)
+        h.postDelayed(detachRunnable, 650)
     }
 
+    private fun dotSize() = ctx.dp(10)
     private fun idleW() = if (prefs.idleWidth > 0) ctx.dp(prefs.idleWidth) else maxOf(notch.w, ctx.dp(28))
     private fun idleH() = if (prefs.idleHeight > 0) ctx.dp(prefs.idleHeight) else maxOf(notch.h, ctx.dp(24))
 
@@ -328,6 +359,9 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         if (fsHidden) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        // When resting as a dot, sit in the middle of the cutout so it disappears into it.
+        val restingInNotch = idle && !prefs.alwaysShowPill
+        val yPx = if (restingInNotch) maxOf(0, (notch.h - dotSize()) / 2) else ctx.dp(prefs.offsetY)
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -337,7 +371,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             x = notch.cx + ctx.dp(prefs.offsetX)
-            y = ctx.dp(prefs.offsetY)
+            y = yPx
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             title = "DynamicIsland"
         }
@@ -367,7 +401,6 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     private fun updateWindow() {
         if (!attached) return
         try {
-            view.alpha = if (fsHidden) 0f else 1f
             wm.updateViewLayout(view, layoutParams())
         } catch (_: Exception) {
         }
@@ -379,7 +412,10 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val hidden = prefs.hideInFullscreen && !i.isVisible(WindowInsets.Type.statusBars())
         if (hidden != fsHidden) {
             fsHidden = hidden
-            h.post { updateWindow() }
+            h.post {
+                if (attached) view.alpha = if (fsHidden) 0f else 1f
+                updateWindow()
+            }
         }
     }
 
