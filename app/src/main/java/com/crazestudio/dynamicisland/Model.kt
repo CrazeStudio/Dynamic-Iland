@@ -6,7 +6,16 @@ import android.graphics.drawable.Drawable
 import android.media.session.MediaController
 import android.os.SystemClock
 
-class Act(val title: String, val intent: PendingIntent?)
+/**
+ * A button on the island. Either fires a [PendingIntent] (real notification actions),
+ * runs [onClick] (built-in buttons), or both. [closes] = hide the card afterwards.
+ */
+class Act(
+    val title: String,
+    val intent: PendingIntent?,
+    val onClick: (() -> Unit)? = null,
+    val closes: Boolean = true
+)
 
 /** Short-lived things the island announces: notifications, calls, charging. */
 sealed class Live(val key: String) {
