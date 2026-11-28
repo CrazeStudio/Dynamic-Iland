@@ -25,16 +25,23 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.Toast
 
 /**
  * Owns the overlay window and decides what the island shows.
+ *
+ * [windowType] TYPE_ACCESSIBILITY_OVERLAY (preferred) draws above the status bar, inside the notch.
+ * TYPE_APPLICATION_OVERLAY (fallback) is drawn below the status bar.
  *
  * Flow for anything that keeps running (music, downloads, charging):
  *   peek  ->  (after the auto-dismiss time)  ->  small coloured dot in the notch
  *   tap the dot to expand it again. When the activity ends, the dot disappears.
  * One-off things (messages) just peek and then hide in the notch.
  */
-class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
+class IslandController(
+    private val ctx: Context,
+    private val windowType: Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+) : ContentFactory.Callbacks {
 
     private val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val prefs = Prefs(ctx)
@@ -49,7 +56,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     private var factory = ContentFactory(ctx, notch, this)
 
     private var media: MediaInfo? = null
-    private var mediaSnoozed = false      // dismissed by the user (swipe up)
+    private var mediaSnoozed = false      // dismissed by the user
     private var mediaCollapsed = false    // shrunk to a dot after the timeout
     private var mediaUi: ContentFactory.MediaUi? = null
     private var tracker: MediaTracker? = null
@@ -237,7 +244,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         } else if (t.isCall()) {
             if (cur != null && !cur.isCall()) pending.addFirst(cur)
             current = t
-            expanded = (t as Live.Notif).actions.size >= 2
+            expanded = (t as Live.Notif).actions.isNotEmpty()
             focusMedia = false
             buzz()
         } else if (cur == null) {
@@ -258,7 +265,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val c = current
         if (keep && c != null && isOngoing(c)) background[c.key] = c
         current = pending.removeFirstOrNull()
-        expanded = current?.isCall() == true && (current as Live.Notif).actions.size >= 2
+        expanded = current?.isCall() == true && (current as Live.Notif).actions.isNotEmpty()
         scheduleTimeout()
         render(animate)
     }
@@ -351,8 +358,9 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         val first = !attached
         attach()
         if (!attached) return
+        view.flatTop = prefs.offsetY == 0 // hug the top edge so it merges with the notch
         if (first) view.snapTo(dotSize(), dotSize(), dotSize() / 2f)
-        else if (wasIdle) updateWindow() // slide back down out of the notch
+        else if (wasIdle) updateWindow() // slide back out of the notch
         view.show(built.view, built.w, built.h, built.radius, true)
     }
 
@@ -386,6 +394,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
                 attach()
                 if (attached) {
                     val b = dotBuilt(color)
+                    view.flatTop = false
                     view.snapTo(b.w, b.h, b.radius)
                     view.show(b.view, b.w, b.h, b.radius, false)
                     shownDot = color
@@ -393,6 +402,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
             } else if (prefs.alwaysShowPill) {
                 attach()
                 if (attached) {
+                    view.flatTop = prefs.offsetY == 0
                     view.snapTo(idleW(), idleH(), idleH() / 2f)
                     view.show(null, idleW(), idleH(), idleH() / 2f, false)
                 }
@@ -403,6 +413,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         if (color != null) {
             if (shownDot == color) return // already showing this dot
             val b = dotBuilt(color)
+            view.flatTop = false
             view.show(b.view, b.w, b.h, b.radius, animate)
             shownDot = color
             h.postDelayed(moveRunnable, 380)
@@ -410,11 +421,13 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         }
         shownDot = null
         if (prefs.alwaysShowPill) {
+            view.flatTop = prefs.offsetY == 0
             view.show(null, idleW(), idleH(), idleH() / 2f, animate)
             return
         }
         // hide: shrink, slide into the notch, fade out
         val d = dotSize()
+        view.flatTop = false
         view.show(null, d, d, d / 2f, animate)
         h.postDelayed(moveRunnable, 380)
         h.postDelayed(detachRunnable, 650)
@@ -440,7 +453,7 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            windowType,
             flags,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -578,7 +591,17 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
 
     // ------------------------------------------------------------------ actions
 
-    override fun runAction(pi: PendingIntent?, finish: Boolean) {
+    /** A button on the island was pressed (real notification action or built-in button). */
+    override fun runAct(a: Act) {
+        try {
+            a.onClick?.invoke()
+        } catch (e: Exception) {
+            Log.w(TAG, "button action failed", e)
+        }
+        runAction(a.intent, a.closes)
+    }
+
+    private fun runAction(pi: PendingIntent?, finish: Boolean) {
         openPi(pi)
         val t = current
         if (finish && t != null && !mediaShown()) finishCurrent(true, false) else if (finish) setExpanded(false)
@@ -615,13 +638,17 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         if (prefs.haptics && attached) view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
     }
 
+    private fun toast(s: String) = Toast.makeText(ctx, s, Toast.LENGTH_SHORT).show()
+
     // ------------------------------------------------------------------ helpers
 
     private val ticker = object : Runnable {
         override fun run() {
             mediaUi?.let { u ->
                 val m = u.info
-                u.progress.progress = if (m.duration > 0) (m.position() * 1000 / m.duration).toInt() else 0
+                val pos = m.position()
+                u.progress.progress = if (m.duration > 0) (pos * 1000 / m.duration).toInt() else 0
+                u.elapsed?.text = fmtTime(pos)
             }
             h.postDelayed(this, 500)
         }
@@ -649,12 +676,40 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
         }
     }
 
-    /** Removes a preview activity after a while so its dot does not stay forever. */
+    // ------------------------------------------------------------------ previews (settings screen)
+
+    private val demoEnds = HashMap<String, Runnable>()
+
+    /** Removes a preview activity after a while so it does not stay forever. */
     private fun endDemo(key: String, afterMs: Long) {
-        h.postDelayed({
+        demoEnds.remove(key)?.let { h.removeCallbacks(it) }
+        val r = Runnable {
+            demoEnds.remove(key)
             background.remove(key)
             if (current?.key == key) finishCurrent(true, false) else if (idle) render()
-        }, afterMs)
+        }
+        demoEnds[key] = r
+        h.postDelayed(r, afterMs)
+    }
+
+    private fun openApp() {
+        try {
+            ctx.startActivity(Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Log.w(TAG, "cannot open app", e)
+        }
+    }
+
+    private fun answerDemo(icon: Drawable?) {
+        toast("Call answered")
+        post(
+            Live.Notif(
+                "demo_call", "Phone", icon, null, "Craze Studio", "On call",
+                0, 0, false, null,
+                listOf(Act("Hang up", null, { toast("Call ended") }, true)), true
+            )
+        )
+        endDemo("demo_call", 30000)
     }
 
     /** Used by the settings screen's preview buttons. */
@@ -669,17 +724,27 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
                 Live.Notif(
                     "demo", "Dynamic Island", icon, null, "Hello from your island",
                     "Tap to expand. Swipe up to dismiss, swipe sideways to switch activities.",
-                    0, 0, false, null, listOf(Act("Open", null), Act("Later", null)), false
+                    0, 0, false, null,
+                    listOf(
+                        Act("Open", null, { openApp() }, true),
+                        Act("Later", null, { toast("Okay, later") }, true)
+                    ),
+                    false
                 )
             )
             "call" -> {
                 post(
                     Live.Notif(
                         "demo_call", "Phone", icon, null, "Craze Studio", "Incoming call",
-                        0, 0, false, null, listOf(Act("Decline", null), Act("Answer", null)), true
+                        0, 0, false, null,
+                        listOf(
+                            Act("Decline", null, { toast("Call declined") }, true),
+                            Act("Answer", null, { answerDemo(icon) }, false)
+                        ),
+                        true
                     )
                 )
-                endDemo("demo_call", 8000)
+                endDemo("demo_call", 15000)
             }
             "charge" -> {
                 post(Live.Charging(batteryLevel(), false))
@@ -700,8 +765,8 @@ class IslandController(private val ctx: Context) : ContentFactory.Callbacks {
     companion object {
         private const val TAG = "DynamicIsland"
         private const val CHARGING_KEY = "charging"
-        private val GREEN = Color.parseColor("#34D399")
-        private val BLUE = Color.parseColor("#60A5FA")
-        private val PINK = Color.parseColor("#F472B6")
+        private val GREEN = Color.parseColor("#30D158")
+        private val BLUE = Color.parseColor("#0A84FF")
+        private val PINK = Color.parseColor("#FF375F")
     }
 }

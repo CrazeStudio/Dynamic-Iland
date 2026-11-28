@@ -35,7 +35,7 @@ class MainActivity : Activity() {
     private val bg = Color.parseColor("#0B0B0D")
     private val card = Color.parseColor("#1C1C1E")
     private val gray = Color.parseColor("#9CA3AF")
-    private val green = Color.parseColor("#34D399")
+    private val green = Color.parseColor("#30D158")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,6 +52,7 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ state
 
     private fun overlayOk() = Settings.canDrawOverlays(this)
+    private fun accessOk() = Access.isEnabled(this)
 
     private fun listenerOk(): Boolean {
         val s = Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: return false
@@ -102,17 +103,21 @@ class MainActivity : Activity() {
         // setup
         col.addView(section("Setup"))
         val setup = cardBox()
-        setup.addView(statusRow("Display over other apps", "Draws the island over the notch", ::overlayOk) {
-            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        setup.addView(statusRow("Accessibility service", "Required: draws the island above the status bar, inside the notch", { accessOk() }) {
+            toast("Find 'Dynamic Island' and switch it on")
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
-        setup.addView(statusRow("Notification access", "Lets the island show notifications and media", ::listenerOk) {
+        setup.addView(statusRow("Notification access", "Lets the island show notifications and media", { listenerOk() }) {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         })
         if (Build.VERSION.SDK_INT >= 33) {
-            setup.addView(statusRow("Post notifications", "Shows the small 'running' notification", ::postOk) {
+            setup.addView(statusRow("Post notifications", "Shows the small 'running' notification (fallback mode)", { postOk() }) {
                 requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
             })
         }
+        setup.addView(statusRow("Display over other apps", "Optional fallback. Sits under the status bar, so prefer accessibility", { overlayOk() }) {
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+        })
         col.addView(setup)
 
         // master switch
@@ -126,19 +131,22 @@ class MainActivity : Activity() {
         col.addView(masterBox, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(14) })
         val masterListener = CompoundButton.OnCheckedChangeListener { _, on ->
             if (on) {
-                if (!overlayOk()) {
-                    toast("Grant 'Display over other apps' first")
+                if (!accessOk() && !overlayOk()) {
+                    toast("Turn on the Accessibility service first")
                     setSilently(master, false)
                     return@OnCheckedChangeListener
                 }
                 prefs.enabled = true
-                startForegroundService(Intent(this, IslandService::class.java))
+                val a = IslandAccessibilityService.instance
+                if (a != null) a.syncEnabled()
+                else if (!accessOk()) startForegroundService(Intent(this, IslandService::class.java))
             } else {
                 prefs.enabled = false
+                IslandAccessibilityService.instance?.syncEnabled()
                 stopService(Intent(this, IslandService::class.java))
             }
         }
-        refreshers.add { setSilently(master, prefs.enabled && overlayOk(), masterListener) }
+        refreshers.add { setSilently(master, prefs.enabled && (accessOk() || overlayOk()), masterListener) }
         master.setOnCheckedChangeListener(masterListener)
 
         // features
@@ -146,7 +154,7 @@ class MainActivity : Activity() {
         val features = cardBox()
         features.addView(switchRow("Notifications", prefs.showNotifications) { prefs.showNotifications = it; applyLive() })
         features.addView(switchRow("Media playback", prefs.showMedia) { prefs.showMedia = it; applyLive() })
-        features.addView(switchRow("Charging and low battery", prefs.showCharging) { prefs.showCharging = it })
+        features.addView(switchRow("Charging and low battery", prefs.showCharging) { prefs.showCharging = it; applyLive() })
         features.addView(switchRow("Haptic feedback", prefs.haptics) { prefs.haptics = it })
         col.addView(features)
 
@@ -169,7 +177,7 @@ class MainActivity : Activity() {
         }
         calib.addView(notchInfo)
         calib.addView(seekRow("Horizontal offset", -80, 80, prefs.offsetX, " dp") { prefs.offsetX = it; applyLive() })
-        calib.addView(seekRow("Vertical offset", 0, 40, prefs.offsetY, " dp") { prefs.offsetY = it; applyLive() })
+        calib.addView(seekRow("Vertical offset (0 = merged with the notch)", 0, 40, prefs.offsetY, " dp") { prefs.offsetY = it; applyLive() })
         calib.addView(seekRow("Idle pill width (0 = auto)", 0, 200, prefs.idleWidth, " dp") { prefs.idleWidth = it; applyLive() })
         calib.addView(seekRow("Idle pill height (0 = auto)", 0, 60, prefs.idleHeight, " dp") { prefs.idleHeight = it; applyLive() })
         col.addView(calib)
@@ -179,7 +187,7 @@ class MainActivity : Activity() {
         col.addView(section("Try it"))
         val tests = cardBox()
         tests.addView(button("Preview notification") { preview("notif") })
-        tests.addView(button("Preview incoming call") { preview("call") })
+        tests.addView(button("Preview incoming call (try Answer / Decline)") { preview("call") })
         tests.addView(button("Preview charging") { preview("charge") })
         tests.addView(button("Preview download progress") { preview("progress") })
         col.addView(tests)

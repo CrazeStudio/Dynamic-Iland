@@ -12,7 +12,10 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 
-/** Foreground service that keeps the island alive. */
+/**
+ * Fallback host (normal overlay window). Used only when the accessibility service is not on.
+ * Note: a normal overlay is drawn under the status bar, so the accessibility host is preferred.
+ */
 class IslandService : Service() {
 
     private var controller: IslandController? = null
@@ -20,7 +23,7 @@ class IslandService : Service() {
     override fun onCreate() {
         super.onCreate()
         startAsForeground()
-        if (!Settings.canDrawOverlays(this)) {
+        if (Access.isEnabled(this) || !Settings.canDrawOverlays(this)) {
             stopSelf()
             return
         }
@@ -38,9 +41,10 @@ class IslandService : Service() {
     }
 
     override fun onDestroy() {
-        controller?.stop()
+        val c = controller
+        c?.stop()
+        if (c != null && IslandBus.controller === c) IslandBus.controller = null
         controller = null
-        IslandBus.controller = null
         super.onDestroy()
     }
 
