@@ -16,6 +16,9 @@ class Prefs(ctx: Context) {
     var hideInFullscreen by bool("hide_fullscreen", false)
     var alwaysShowPill by bool("always_pill", false)
 
+    /** which side of the camera the activity dot sits on */
+    var dotRight by bool("dot_right", false)
+
     /** seconds a notification peek stays visible */
     var autoDismissSec by int("auto_dismiss", 5)
 

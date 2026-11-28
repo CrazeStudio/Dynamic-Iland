@@ -1,5 +1,6 @@
 package com.crazestudio.dynamicisland
 
+import android.animation.ValueAnimator
 import android.app.ActivityOptions
 import android.app.Notification
 import android.app.PendingIntent
@@ -17,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.service.notification.StatusBarNotification
 import android.util.Log
 import android.view.Gravity
@@ -24,8 +26,10 @@ import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.Toast
+import kotlin.math.abs
 
 /**
  * Owns the overlay window and decides what the island shows.
@@ -34,9 +38,12 @@ import android.widget.Toast
  * TYPE_APPLICATION_OVERLAY (fallback) is drawn below the status bar.
  *
  * Flow for anything that keeps running (music, downloads, charging):
- *   peek  ->  (after the auto-dismiss time)  ->  small coloured dot in the notch
- *   tap the dot to expand it again. When the activity ends, the dot disappears.
+ *   peek  ->  (after the auto-dismiss time)  ->  small coloured dot next to the camera
+ *   tap the dot to expand it again. When the activity ends or is paused, the dot disappears.
  * One-off things (messages) just peek and then hide in the notch.
+ *
+ * Battery: nothing runs while idle. The progress ticker only runs while the expanded
+ * player is on screen, and repeated media / progress updates are not re-rendered.
  */
 class IslandController(
     private val ctx: Context,
@@ -55,6 +62,11 @@ class IslandController(
     private var notch = Notch.detect(ctx, prefs)
     private var factory = ContentFactory(ctx, notch, this)
 
+    // animated window position (px)
+    private var winX = 0
+    private var winY = 0
+    private var winAnim: ValueAnimator? = null
+
     private var media: MediaInfo? = null
     private var mediaSnoozed = false      // dismissed by the user
     private var mediaCollapsed = false    // shrunk to a dot after the timeout
@@ -65,6 +77,9 @@ class IslandController(
     private val pending = ArrayDeque<Live>()
     /** Ongoing activities (downloads, charging) that are shown as a dot. */
     private val background = LinkedHashMap<String, Live>()
+    /** Progress notifications that were seen running (used to detect "paused"). */
+    private val ongoingKeys = HashSet<String>()
+    private var lastProgressRender = 0L
     private var expanded = false
     private var focusMedia = false
     private var fsHidden = false
@@ -86,6 +101,7 @@ class IslandController(
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_POWER_DISCONNECTED)
             addAction(Intent.ACTION_BATTERY_LOW)
+            addAction(Intent.ACTION_SCREEN_ON)
         }
         if (Build.VERSION.SDK_INT >= 33) {
             ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -99,12 +115,12 @@ class IslandController(
         }
         tracker = MediaTracker(ctx) { onMedia(it) }
         if (prefs.showMedia) tracker?.start()
-        h.post(ticker)
         render(false)
     }
 
     fun stop() {
         h.removeCallbacksAndMessages(null)
+        winAnim?.cancel()
         try {
             ctx.unregisterReceiver(receiver)
         } catch (_: Exception) {
@@ -115,7 +131,7 @@ class IslandController(
     }
 
     fun onListenerReady() {
-        if (prefs.showMedia) tracker?.start()
+        if (prefs.showMedia) tracker?.restart()
     }
 
     fun onConfigChanged() {
@@ -136,7 +152,12 @@ class IslandController(
         }
         if (!prefs.showCharging) background.remove(CHARGING_KEY)
         shownDot = null
-        if (attached) updateWindow()
+        winAnim?.cancel()
+        if (attached) {
+            winX = targetX()
+            winY = targetY()
+            updateWindow()
+        }
         render(false)
     }
 
@@ -153,6 +174,7 @@ class IslandController(
         if (n.priority <= Notification.PRIORITY_MIN) return
 
         val e = n.extras ?: return
+        val key = sbn.key
         val isCall = n.category == Notification.CATEGORY_CALL
         val max = e.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
         val prog = e.getInt(Notification.EXTRA_PROGRESS, 0)
@@ -164,6 +186,30 @@ class IslandController(
         val title = (e.getCharSequence(Notification.EXTRA_TITLE) ?: "").toString()
         val text = (e.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: e.getCharSequence(Notification.EXTRA_TEXT) ?: "").toString()
         if (title.isBlank() && text.isBlank()) return
+
+        if (inProgress) {
+            if (ongoing) ongoingKeys.add(key)
+            // A paused download: the word "pause" in the text, or it stopped being ongoing.
+            val paused = title.contains("pause", true) || text.contains("pause", true) ||
+                (!ongoing && key in ongoingKeys)
+            if (paused) {
+                dropActivity(key)
+                return
+            }
+            // Cheap path for the frequent progress updates: reuse icons, build nothing new.
+            val existing = background[key] ?: current?.takeIf { it.key == key }
+            if (existing is Live.Notif && existing.hasProgress) {
+                post(
+                    Live.Notif(
+                        key, existing.appName, existing.icon, existing.avatar, title, text,
+                        prog, max, indet, n.contentIntent, existing.actions, false
+                    )
+                )
+                return
+            }
+        } else {
+            ongoingKeys.remove(key)
+        }
 
         val (label, icon) = appInfo(pkg, e)
         val avatar: Drawable? = try {
@@ -177,7 +223,7 @@ class IslandController(
 
         post(
             Live.Notif(
-                key = sbn.key, appName = label, icon = icon, avatar = avatar,
+                key = key, appName = label, icon = icon, avatar = avatar,
                 title = title, text = text,
                 progress = if (inProgress) prog else 0,
                 progressMax = if (inProgress) max else 0,
@@ -188,6 +234,12 @@ class IslandController(
     }
 
     fun onNotificationRemoved(key: String) {
+        ongoingKeys.remove(key)
+        dropActivity(key)
+    }
+
+    /** Remove an activity everywhere (finished, cancelled or paused). */
+    private fun dropActivity(key: String) {
         background.remove(key)
         pending.removeAll { it.key == key }
         if (current?.key == key) finishCurrent(true, false) else if (idle) render()
@@ -196,6 +248,13 @@ class IslandController(
     private fun onMedia(info: MediaInfo?) {
         val old = media
         media = info
+        // Many players report the same state over and over: do not rebuild the UI for that.
+        if (old != null && info != null && old.title == info.title && old.artist == info.artist &&
+            old.playing == info.playing && old.duration == info.duration && old.art === info.art
+        ) {
+            val drift = abs(old.position() - info.position())
+            if (!expanded || drift < 2000) return
+        }
         if (info == null || old == null || old.title != info.title || (info.playing && !old.playing)) {
             mediaSnoozed = false
             mediaCollapsed = false
@@ -218,6 +277,8 @@ class IslandController(
                     if (current is Live.Charging) finishCurrent(true, false) else if (idle) render()
                 }
                 Intent.ACTION_BATTERY_LOW -> if (prefs.showCharging) post(Live.Charging(batteryLevel(), true))
+                // after the phone slept the media listener can be gone: register it again
+                Intent.ACTION_SCREEN_ON -> if (prefs.showMedia) tracker?.restart()
             }
         }
     }
@@ -241,6 +302,15 @@ class IslandController(
         val cur = current
         if (cur != null && cur.key == t.key) {
             current = t
+            // progress ticking along: refresh at most once a second, do not restart the timer
+            if (t is Live.Notif && t.hasProgress) {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastProgressRender >= 1000) {
+                    lastProgressRender = now
+                    render()
+                }
+                return
+            }
         } else if (t.isCall()) {
             if (cur != null && !cur.isCall()) pending.addFirst(cur)
             current = t
@@ -292,7 +362,9 @@ class IslandController(
         if (t != null && t.isCall()) return
         val secs = prefs.autoDismissSec.coerceIn(2, 30)
         if (mediaShown()) {
-            h.postDelayed(timeout, if (expanded) 8000L else secs * 1000L)
+            // paused music left open closes quickly, playing music stays a bit longer
+            val open = if (activeMedia()?.playing == true) 8000L else 3000L
+            h.postDelayed(timeout, if (expanded) open else secs * 1000L)
         } else if (t != null) {
             h.postDelayed(timeout, (if (expanded) secs * 3 else secs) * 1000L)
         }
@@ -312,8 +384,6 @@ class IslandController(
         return expanded || (m.playing && !mediaCollapsed)
     }
 
-    private val moveRunnable = Runnable { if (idle) updateWindow() }
-
     private val detachRunnable = Runnable {
         if (idle) {
             view.animate().alpha(0f).setDuration(220).withEndAction {
@@ -324,7 +394,6 @@ class IslandController(
 
     private fun render(animate: Boolean = true) {
         h.removeCallbacks(detachRunnable)
-        h.removeCallbacks(moveRunnable)
         if (attached) {
             view.animate().cancel()
             view.alpha = if (fsHidden) 0f else 1f
@@ -346,6 +415,7 @@ class IslandController(
             else -> null
         }
         mediaUi = built?.ui
+        updateTicker()
 
         if (built == null) {
             goIdle(animate)
@@ -360,7 +430,7 @@ class IslandController(
         if (!attached) return
         view.flatTop = prefs.offsetY == 0 // hug the top edge so it merges with the notch
         if (first) view.snapTo(dotSize(), dotSize(), dotSize() / 2f)
-        else if (wasIdle) updateWindow() // slide back out of the notch
+        else if (wasIdle) animateWindow() // slide back out of the notch
         view.show(built.view, built.w, built.h, built.radius, true)
     }
 
@@ -368,16 +438,18 @@ class IslandController(
         val bgItem = background.values.lastOrNull()
         if (bgItem != null) return if (bgItem is Live.Charging) GREEN else BLUE
         val m = activeMedia()
+        // only while the music is really playing: paused music shows nothing
         if (m != null && m.playing) return PINK
         return null
     }
 
+    /** A black circle (like a second camera hole) with a small coloured dot inside. */
     private fun dotBuilt(color: Int): ContentFactory.Built {
         val s = dotBox()
         val box = FrameLayout(ctx)
         box.addView(
             View(ctx).apply { background = roundBg(color, ctx.dpf(8f)) },
-            FrameLayout.LayoutParams(ctx.dp(10), ctx.dp(10), Gravity.CENTER)
+            FrameLayout.LayoutParams(ctx.dp(11), ctx.dp(11), Gravity.CENTER)
         )
         return ContentFactory.Built(box, s, s, s / 2f)
     }
@@ -416,29 +488,70 @@ class IslandController(
             view.flatTop = false
             view.show(b.view, b.w, b.h, b.radius, animate)
             shownDot = color
-            h.postDelayed(moveRunnable, 380)
+            animateWindow()
             return
         }
         shownDot = null
         if (prefs.alwaysShowPill) {
             view.flatTop = prefs.offsetY == 0
             view.show(null, idleW(), idleH(), idleH() / 2f, animate)
+            animateWindow()
             return
         }
         // hide: shrink, slide into the notch, fade out
         val d = dotSize()
         view.flatTop = false
         view.show(null, d, d, d / 2f, animate)
-        h.postDelayed(moveRunnable, 380)
+        animateWindow()
         h.postDelayed(detachRunnable, 650)
     }
 
     private fun dotSize() = ctx.dp(10)
-    private fun dotBox() = ctx.dp(26)
+    private fun dotBox() = ctx.dp(36)
     private fun idleW() = if (prefs.idleWidth > 0) ctx.dp(prefs.idleWidth) else maxOf(notch.w, ctx.dp(28))
     private fun idleH() = if (prefs.idleHeight > 0) ctx.dp(prefs.idleHeight) else maxOf(notch.h, ctx.dp(24))
 
     // ------------------------------------------------------------------ window
+
+    /** The dot sits NEXT to the camera: touches on the camera hole itself are often not delivered. */
+    private fun targetX(): Int {
+        val base = notch.cx + ctx.dp(prefs.offsetX)
+        if (!(idle && dotMode)) return base
+        val side = if (prefs.dotRight) 1 else -1
+        return base + side * (notch.w / 2 + dotBox() / 2 + ctx.dp(6))
+    }
+
+    private fun targetY(): Int {
+        val inNotch = idle && (dotMode || !prefs.alwaysShowPill)
+        val rest = if (dotMode) dotBox() else dotSize()
+        return if (inNotch) maxOf(0, (notch.h - rest) / 2) else ctx.dp(prefs.offsetY)
+    }
+
+    /** Slide the window to where the current state wants it. */
+    private fun animateWindow() {
+        winAnim?.cancel()
+        val x1 = targetX()
+        val y1 = targetY()
+        if (!attached) {
+            winX = x1
+            winY = y1
+            return
+        }
+        val x0 = winX
+        val y0 = winY
+        if (x0 == x1 && y0 == y1) return
+        winAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 320
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                val p = it.animatedValue as Float
+                winX = (x0 + (x1 - x0) * p).toInt()
+                winY = (y0 + (y1 - y0) * p).toInt()
+                updateWindow()
+            }
+            start()
+        }
+    }
 
     private fun layoutParams(): WindowManager.LayoutParams {
         var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -446,10 +559,6 @@ class IslandController(
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
         if (fsHidden) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-        // Resting as a dot: sit in the middle of the cutout so it lives inside the notch.
-        val inNotch = idle && (dotMode || !prefs.alwaysShowPill)
-        val restSize = if (dotMode) dotBox() else dotSize()
-        val yPx = if (inNotch) maxOf(0, (notch.h - restSize) / 2) else ctx.dp(prefs.offsetY)
         return WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -458,8 +567,8 @@ class IslandController(
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            x = notch.cx + ctx.dp(prefs.offsetX)
-            y = yPx
+            x = winX
+            y = winY
             layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             title = "DynamicIsland"
         }
@@ -468,6 +577,9 @@ class IslandController(
     private fun attach() {
         if (attached) return
         try {
+            winAnim?.cancel()
+            winX = targetX()
+            winY = targetY()
             view.alpha = if (fsHidden) 0f else 1f
             wm.addView(view, layoutParams())
             attached = true
@@ -478,6 +590,7 @@ class IslandController(
 
     private fun detachNow() {
         if (!attached) return
+        winAnim?.cancel()
         try {
             wm.removeViewImmediate(view)
         } catch (_: Exception) {
@@ -642,16 +755,21 @@ class IslandController(
 
     // ------------------------------------------------------------------ helpers
 
+    /** Runs only while the expanded player is on screen, so an idle island costs nothing. */
     private val ticker = object : Runnable {
         override fun run() {
-            mediaUi?.let { u ->
-                val m = u.info
-                val pos = m.position()
-                u.progress.progress = if (m.duration > 0) (pos * 1000 / m.duration).toInt() else 0
-                u.elapsed?.text = fmtTime(pos)
-            }
-            h.postDelayed(this, 500)
+            val u = mediaUi ?: return
+            val m = u.info
+            val pos = m.position()
+            u.progress.progress = if (m.duration > 0) (pos * 1000 / m.duration).toInt() else 0
+            u.elapsed?.text = fmtTime(pos)
+            h.postDelayed(this, 1000)
         }
+    }
+
+    private fun updateTicker() {
+        h.removeCallbacks(ticker)
+        if (mediaUi != null && media?.playing == true) h.postDelayed(ticker, 1000)
     }
 
     private fun batteryLevel(): Int {
@@ -685,8 +803,8 @@ class IslandController(
         demoEnds.remove(key)?.let { h.removeCallbacks(it) }
         val r = Runnable {
             demoEnds.remove(key)
-            background.remove(key)
-            if (current?.key == key) finishCurrent(true, false) else if (idle) render()
+            ongoingKeys.remove(key)
+            dropActivity(key)
         }
         demoEnds[key] = r
         h.postDelayed(r, afterMs)

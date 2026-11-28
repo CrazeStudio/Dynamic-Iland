@@ -2,6 +2,7 @@ package com.crazestudio.dynamicisland
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -10,6 +11,7 @@ import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
@@ -62,6 +64,11 @@ class MainActivity : Activity() {
     private fun postOk() = Build.VERSION.SDK_INT < 33 ||
         checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+    private fun powerOk(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
     private fun applyLive() {
         IslandBus.controller?.refreshSettings()
         refreshNotchInfo()
@@ -109,6 +116,13 @@ class MainActivity : Activity() {
         })
         setup.addView(statusRow("Notification access", "Lets the island show notifications and media", { listenerOk() }) {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        })
+        setup.addView(statusRow("Keep running (recommended)", "Stops battery optimisation from closing the island after inactivity", { powerOk() }) {
+            try {
+                startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
         })
         if (Build.VERSION.SDK_INT >= 33) {
             setup.addView(statusRow("Post notifications", "Shows the small 'running' notification (fallback mode)", { postOk() }) {
@@ -164,6 +178,7 @@ class MainActivity : Activity() {
         behaviour.addView(switchRow("Hide in landscape", prefs.hideInLandscape) { prefs.hideInLandscape = it; applyLive() })
         behaviour.addView(switchRow("Hide in fullscreen apps (experimental)", prefs.hideInFullscreen) { prefs.hideInFullscreen = it; applyLive() })
         behaviour.addView(switchRow("Always show the pill", prefs.alwaysShowPill) { prefs.alwaysShowPill = it; applyLive() })
+        behaviour.addView(switchRow("Activity dot on the right of the camera", prefs.dotRight) { prefs.dotRight = it; applyLive() })
         behaviour.addView(seekRow("Auto-dismiss", 2, 15, prefs.autoDismissSec, " s") { prefs.autoDismissSec = it })
         col.addView(behaviour)
 
@@ -193,7 +208,7 @@ class MainActivity : Activity() {
         col.addView(tests)
 
         col.addView(label(
-            "Gestures: tap to expand, long press to open the app, swipe up to dismiss, swipe sideways to switch between media and notifications.",
+            "Gestures: tap to expand, tap the dot to reopen a running activity, long press to open the app, swipe up to dismiss, swipe sideways to switch between media and notifications.",
             12f, gray
         ).apply { setPadding(dp(4), dp(16), dp(4), 0) })
 

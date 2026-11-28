@@ -37,6 +37,12 @@ class MediaTracker(private val ctx: Context, private val onChange: (MediaInfo?) 
         }
     }
 
+    /** Re-registers everything. Used when the screen turns on or the listener reconnects. */
+    fun restart() {
+        stop()
+        start()
+    }
+
     fun stop() {
         if (started) {
             try {
